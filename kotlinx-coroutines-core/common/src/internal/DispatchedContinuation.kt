@@ -191,7 +191,7 @@ internal class DispatchedContinuation<in T>(
         if (dispatcher.isDispatchNeeded(context)) {
             _state = state
             resumeMode = MODE_ATOMIC
-            dispatcher.dispatch(context, this)
+            dispatchWithExceptionHandling(context)
         } else {
             executeUnconfined(state, MODE_ATOMIC) {
                 withCoroutineContext(this.context, countOrElement) {
@@ -212,7 +212,7 @@ internal class DispatchedContinuation<in T>(
         if (dispatcher.isDispatchNeeded(context)) {
             _state = state
             resumeMode = MODE_CANCELLABLE
-            dispatcher.dispatch(context, this)
+            dispatchWithExceptionHandling(context)
         } else {
             executeUnconfined(state, MODE_CANCELLABLE) {
                 if (!resumeCancelled(state)) {
@@ -260,6 +260,14 @@ internal class DispatchedContinuation<in T>(
 
     override fun toString(): String =
         "DispatchedContinuation[$dispatcher, ${continuation.toDebugString()}]"
+
+    private fun dispatchWithExceptionHandling(context: CoroutineContext) {
+        try {
+            dispatcher.dispatch(context, this)
+        } catch (e: Throwable) {
+            throw DispatchException(e)
+        }
+    }
 }
 
 /**
