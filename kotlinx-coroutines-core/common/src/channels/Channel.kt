@@ -15,15 +15,58 @@ import kotlin.internal.*
 import kotlin.jvm.*
 
 /**
- * Sender's interface to [Channel].
+ * Sender's interface to a [Channel].
+ *
+ * Combined, [SendChannel] and [ReceiveChannel] define the complete [Channel] interface.
  */
 public interface SendChannel<in E> {
     /**
      * Returns `true` if this channel was closed by an invocation of [close] or its receiving side was [cancelled][ReceiveChannel.cancel].
      * This means that calling [send] will result in an exception.
      *
-     * Note that if this property returns `false`, it does not guarantee that consecutive call to [send] will succeed, as the
-     * channel can be concurrently closed right after the check. For such scenarios, it is recommended to use [trySend] instead.
+     * Note that if this property returns `false`, it does not guarantee that consecutive call to [send] will succeed,
+     * as the channel can be concurrently closed right after the check.
+     * For such scenarios, [trySend] is the more robust solution: it attempts to send the element and returns
+     * a result that says whether the channel was closed, and if not, whether sending a value was successful.
+     *
+     * ```
+     * // DANGER! THIS CHECK IS NOT RELIABLE!
+     * if (!channel.isClosedForSend) {
+     *     channel.send(element) // can still fail!
+     * } else {
+     *     println("Can not send: the channel is closed")
+     * }
+     * // DO THIS INSTEAD:
+     * val result = channel.trySend(element)
+     * when {
+     *     result.isClosed -> println("Can not send: the channel is closed")
+     * }
+     * ```
+     *
+     * The primary intended usage of this property is skipping some portions of code that should not be executed.
+     * For example:
+     *
+     * ```
+     * if (channel.isClosedForSend) {
+     *    // fast path
+     *    return
+     * } else {
+     *    // slow path: actually computing the value
+     *    val nextElement = run {
+     *        // some heavy computation
+     *    }
+     *    channel.send(nextElement) // can fail anyway,
+     *    // but at least we tried to avoid the computation
+     * }
+     * ```
+     *
+     * However, in many cases, even that can be achieved more idiomatically by cancelling the coroutine producing the
+     * elements to send.
+     * See [produce] for a way to launch a coroutine that produces elements and cancels itself when the channel is
+     * closed.
+     *
+     * Alternatively, [isClosedForSend] can be used for assertions and diagnostics to verify the expected state
+     * of the channel.
      *
      * @see SendChannel.trySend
      * @see SendChannel.close
@@ -33,13 +76,32 @@ public interface SendChannel<in E> {
     public val isClosedForSend: Boolean
 
     /**
-     * Sends the specified [element] to this channel, suspending the caller while the buffer of this channel is full
-     * or if it does not exist, or throws an exception if the channel [is closed for `send`][isClosedForSend] (see [close] for details).
+     * Sends the specified [element] to this channel.
      *
-     * [Closing][close] a channel _after_ this function has suspended does not cause this suspended [send] invocation
-     * to abort, because closing a channel is conceptually like sending a special "close token" over this channel.
-     * All elements sent over the channel are delivered in first-in first-out order. The sent element
-     * will be delivered to receivers before the close token.
+     * This function may suspend if it does not manage to pass the element to the channel's buffer
+     * or the receiving side, and it can be cancelled without successfully passing the element.
+     * See the "Suspending and cancellation" section below for details.
+     * If the channel is [closed][close], an exception is thrown (see below).
+     *
+     * ```
+     * val channel = Channel<Int>()
+     * launch {
+     *     check(channel.receive() == 5)
+     * }
+     * channel.send(5) // suspends until 5 is received
+     * ```
+     *
+     * ## Suspending and cancellation
+     *
+     * If the [BufferOverflow] strategy of this channel is [BufferOverflow.SUSPEND],
+     * this function may suspend.
+     * The exact scenarios differ depending on the channel's capacity:
+     * - If the channel is [rendezvous][RENDEZVOUS],
+     *   the sender will be suspended until the receiver calls [ReceiveChannel.receive].
+     * - If the channel is [unlimited][UNLIMITED] or [conflated][CONFLATED],
+     *   the sender will never be suspended even with the [BufferOverflow.SUSPEND] strategy.
+     * - If the channel is [buffered][BUFFERED] or has a specific capacity, the sender will be suspended until the
+     *   buffer has free space.
      *
      * This suspending function is cancellable: if the [Job] of the current coroutine is cancelled while this
      * suspending function is waiting, this function immediately resumes with [CancellationException].
@@ -50,10 +112,40 @@ public interface SendChannel<in E> {
      * See "Undelivered elements" section in [Channel] documentation for details on handling undelivered elements.
      *
      * Note that this function does not check for cancellation when it is not suspended.
-     * Use [yield] or [CoroutineScope.isActive] to periodically check for cancellation in tight loops if needed.
+     * Use [ensureActive] or [CoroutineScope.isActive] to periodically check for cancellation in tight loops if needed:
+     *
+     * ```
+     * val channel = Channel<Int>(Channel.UNLIMITED) // will not suspend
+     * val job = launch {
+     *     while (isActive) {
+     *         channel.send(42)
+     *     }
+     *     // the loop exits when the job is cancelled
+     * }
+     * ```
+     *
+     * This isn't needed if other functions are called that are cancellable, like [delay].
+     *
+     * ## Sending to a closed channel
+     *
+     * If a channel was [closed][close] before [send] was called and no cause was specified,
+     * an [ClosedSendChannelException] will be thrown from [send].
+     * If a channel was [closed][close] with a cause before [send] was called,
+     * then [send] will rethrow the exact object that was passed to [close].
+     *
+     * In both cases, it is guaranteed that the element was not delivered to the consumer,
+     * and the `onUndeliveredElement` callback will be called.
+     * See the "Undelivered elements" section in [Channel] documentation for details on handling undelivered elements.
+     *
+     * [Closing][close] a channel _after_ this function has suspended does not cause this suspended [send] invocation
+     * to abort, because closing a channel is conceptually like sending a special "close token" over this channel.
+     * All elements sent over the channel are delivered in the first-in first-out order. The sent element
+     * will be delivered to receivers before the close token.
+     *
+     * ## Related
      *
      * This function can be used in [select] invocations with the [onSend] clause.
-     * Use [trySend] to try sending to this channel without waiting.
+     * Use [trySend] to try sending to this channel without waiting and throwing.
      */
     public suspend fun send(element: E)
 
@@ -62,18 +154,49 @@ public interface SendChannel<in E> {
      * as the parameter is sent to the channel. When the clause is selected, the reference to this channel
      * is passed into the corresponding block.
      *
-     * The [select] invocation fails with an exception if the channel [is closed for `send`][isClosedForSend] (see [close] for details).
+     * The [select] invocation fails with an exception if the channel [is closed for `send`][isClosedForSend] before
+     * the [select] suspends (see the "Sending to a closed channel" section of [send]).
+     *
+     * Example:
+     * ```
+     * val sendChannels = List(4) { index ->
+     *     Channel<Int>(onUndeliveredElement = {
+     *         println("Undelivered element $it for $index")
+     *     }).also { channel ->
+     *         // launch a consumer for this channel
+     *         launch {
+     *             withTimeout(1.seconds) {
+     *                 println("Consumer $index receives: ${channel.receive()}")
+     *             }
+     *         }
+     *     }
+     * }
+     * val element = 42
+     * select {
+     *     for (channel in sendChannels) {
+     *         channel.onSend(element) {
+     *             println("Sent to channel $it")
+     *         }
+     *     }
+     * }
+     * ```
+     * Here, we start a [select] expression that waits for exactly one of four [onSend] invocations to successfully send
+     * the element to the receiver, and the other three will instead invoke the `onUndeliveredElement` callback.
+     * See the "Undelivered elements" section in [Channel] documentation for details on handling undelivered elements.
      */
     public val onSend: SelectClause2<E, SendChannel<E>>
 
     /**
-     * Immediately adds the specified [element] to this channel, if this doesn't violate its capacity restrictions,
-     * and returns the successful result. Otherwise, returns failed or closed result.
-     * This is synchronous variant of [send], which backs off in situations when `send` suspends or throws.
+     * Attempts to add the specified [element] to this channel without waiting.
      *
-     * When `trySend` call returns a non-successful result, it guarantees that the element was not delivered to the consumer, and
-     * it does not call `onUndeliveredElement` that was installed for this channel.
-     * See "Undelivered elements" section in [Channel] documentation for details on handling undelivered elements.
+     * [trySend] never suspends and never throws exceptions
+     * Instead, it returns a [ChannelResult] that encapsulates the result of the operation.
+     * This makes it different from [send], which can suspend and throw exceptions.
+     *
+     * If this channel is currently full and cannot receive new elements at the time or is [closed][close],
+     * this function returns a result that indicates [a failure][ChannelResult.isFailure].
+     * In this case, it is guaranteed that the element was not delivered to the consumer and the
+     * `onUndeliveredElement` callback, if one is provided during the [Channel]'s construction, does *not* get called.
      */
     public fun trySend(element: E): ChannelResult<Unit>
 
@@ -301,6 +424,10 @@ public interface ReceiveChannel<out E> {
      * [isClosedForSend][SendChannel.isClosedForSend]
      * on the side of [SendChannel] start returning `true`. Any attempt to send to or receive from this channel
      * will lead to a [CancellationException].
+     *
+     * If the channel has an `onUndeliveredElement` callback installed, this function will invoke it for each of the
+     * elements still in the channel, since these elements will be inaccessible otherwise.
+     * If the callback is not installed, these elements will simply be removed from the channel.
      */
     public fun cancel(cause: CancellationException? = null)
 
